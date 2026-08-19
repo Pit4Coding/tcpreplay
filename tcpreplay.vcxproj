@@ -158,11 +158,13 @@ Packet.lib;%(AdditionalDependencies)</AdditionalDependencies>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="packet_edit.cpp" />
     <ClCompile Include="pcap_source.cpp" />
+    <ClCompile Include="rewrite_cli.cpp" />
     <ClCompile Include="tcpprep_cache.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="packet_edit.h" />
     <ClInclude Include="pcap_source.h" />
+    <ClInclude Include="rewrite_cli.h" />
     <ClInclude Include="tcpprep_cache.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

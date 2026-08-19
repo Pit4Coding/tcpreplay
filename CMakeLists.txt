@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(tcpreplay_common STATIC
     packet_edit.cpp
     pcap_source.cpp
+    rewrite_cli.cpp
     tcpprep_cache.cpp
 )
 target_include_directories(tcpreplay_common PUBLIC

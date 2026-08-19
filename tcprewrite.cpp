@@ -5,6 +5,7 @@
 
 #include "packet_edit.h"
 #include "pcap_source.h"
+#include "rewrite_cli.h"
 
 #include <cerrno>
 #include <cmath>
@@ -40,16 +41,6 @@ void help() {
         << "  -h, --help               affiche cette aide\n";
 }
 
-bool parsePort(const char* text, int& port) {
-    if (!text || !*text || *text == '-') return false;
-    char* end = nullptr;
-    errno = 0;
-    unsigned long value = std::strtoul(text, &end, 10);
-    if (errno || !end || *end || value == 0 || value > 65535) return false;
-    port = static_cast<int>(value);
-    return true;
-}
-
 bool samePath(const std::string& left, const std::string& right) {
     char a[MAX_PATH]{}, b[MAX_PATH]{};
     if (!GetFullPathNameA(left.c_str(), MAX_PATH, a, nullptr) || !GetFullPathNameA(right.c_str(), MAX_PATH, b, nullptr)) return left == right;
@@ -68,18 +59,7 @@ int parse(int argc, char** argv, Options& options) {
         if (arg == "-v" || arg == "--verbose") { options.verbose = true; continue; }
         if (arg == "-i" || arg == "--infile") { auto value = next(); if (!value) return -1; options.input = value; continue; }
         if (arg == "-o" || arg == "--outfile") { auto value = next(); if (!value) return -1; options.output = value; continue; }
-        if (arg == "--src-ip" || arg == "--dst-ip") {
-            auto value = next(); if (!value) return -1; in_addr address{};
-            if (inet_pton(AF_INET, value, &address) != 1) { std::cerr << "Erreur: adresse IPv4 invalide: " << value << "\n"; return -1; }
-            if (arg == "--src-ip") options.rewrite.sourceIp = value; else options.rewrite.destinationIp = value;
-            continue;
-        }
-        if (arg == "--sport" || arg == "--dport") {
-            auto value = next(); if (!value) return -1; int port = -1;
-            if (!parsePort(value, port)) { std::cerr << "Erreur: port invalide: " << value << "\n"; return -1; }
-            if (arg == "--sport") options.rewrite.sourcePort = port; else options.rewrite.destinationPort = port;
-            continue;
-        }
+        if (isRewriteOption(arg)) { auto value=next();if(!value)return -1;std::string error;if(!applyRewriteOption(arg,value,options.rewrite,error)){std::cerr<<"Erreur: "<<error<<"\n";return -1;}continue; }
         std::cerr << "Erreur: option inconnue: " << arg << "\n";
         return -1;
     }

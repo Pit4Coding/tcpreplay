@@ -4,6 +4,7 @@
 #include <ws2tcpip.h>
 #include "packet_edit.h"
 #include "pcap_source.h"
+#include "rewrite_cli.h"
 #include "tcpprep_cache.h"
 #include <atomic>
 #include <chrono>
@@ -48,6 +49,7 @@ struct Config {
 struct Stats { uint64_t packets=0, bytes=0, failed=0, dropped=0, processed=0; std::chrono::steady_clock::time_point start; };
 
 void version() { std::cout << programName << " version " << VERSION << " (Windows native, Npcap)\n"; }
+bool editingEnabled() { return programName == "tcpreplay-edit"; }
 void help() {
     version();
     std::cout <<
@@ -79,11 +81,14 @@ void help() {
         "  -W, --suppress-warnings  masque les avertissements\n"
         "      --include <liste>    envoie seulement les numeros selectionnes\n"
         "      --exclude <liste>    exclut les numeros selectionnes\n"
-        "  -K, --preload-pcap       prechargement en memoire\n"
+        "  -K, --preload-pcap       prechargement en memoire\n";
+    if(editingEnabled())std::cout <<
+        "\nReecriture a la volee:\n"
         "      --src-ip <adresse>   reecrit l'adresse IPv4 source\n"
         "      --dst-ip <adresse>   reecrit l'adresse IPv4 destination\n"
         "      --sport <port>       reecrit le port TCP/UDP source\n"
-        "      --dport <port>       reecrit le port TCP/UDP destination\n"
+        "      --dport <port>       reecrit le port TCP/UDP destination\n";
+    std::cout <<
         "      --show-delta         affiche le delai reel entre envois\n"
         "  -v, --verbose            detail des envois\n"
         "  -V, --version            version\n  -h, --help               aide\n\n"
@@ -141,16 +146,7 @@ Parse parse(int argc, char** argv, Config& c, std::string& error) {
         }
         if (a=="--loss") { auto v=next();if(!v)return Parse::Error;char* e=nullptr;errno=0;c.lossPercent=std::strtod(v,&e);if(errno||!e||*e||!std::isfinite(c.lossPercent)||c.lossPercent<0||c.lossPercent>100){error="--loss doit etre compris entre 0 et 100";return Parse::Error;}continue; }
         if (a=="--include" || a=="--exclude") { auto v=next();if(!v)return Parse::Error;if(c.includeSelection||c.excludeSelection){error="--include et --exclude sont mutuellement exclusifs";return Parse::Error;}if(!parseSelection(v,c.selection)){error="selection de paquets invalide: "+std::string(v);return Parse::Error;}c.includeSelection=a=="--include";c.excludeSelection=a=="--exclude";continue; }
-        if (a=="--src-ip" || a=="--dst-ip") {
-            auto v=next(); if(!v)return Parse::Error; in_addr address{};
-            if(inet_pton(AF_INET,v,&address)!=1){error="adresse IPv4 invalide: "+std::string(v);return Parse::Error;}
-            if(a=="--src-ip")c.rewriteOptions.sourceIp=v;else c.rewriteOptions.destinationIp=v; continue;
-        }
-        if (a=="--sport" || a=="--dport") {
-            auto v=next(); uint64_t port=0; if(!v)return Parse::Error;
-            if(!uintValue(v,port)||port==0||port>65535){error="port invalide: "+std::string(v);return Parse::Error;}
-            if(a=="--sport")c.rewriteOptions.sourcePort=(int)port;else c.rewriteOptions.destinationPort=(int)port; continue;
-        }
+        if (isRewriteOption(a)) { if(!editingEnabled()){error=a+" est reservee a tcpreplay-edit";return Parse::Error;}auto v=next();if(!v)return Parse::Error;if(!applyRewriteOption(a,v,c.rewriteOptions,error))return Parse::Error;continue; }
         if (a=="-T" || a=="--timer") {
             auto v=next(); if(!v)return Parse::Error; std::string mode=v;
             if(mode=="select")c.timer=TimerMode::Select;
