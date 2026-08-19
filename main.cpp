@@ -212,17 +212,47 @@ void rewrite(Packet& packet,const Config& c){
     uint32_t sum=0;sum=checksumAdd(sum,ip+12,8);sum+=protocol;sum+=static_cast<uint16_t>(transportLength);sum=checksumAdd(sum,transport,transportLength);
     uint16_t result=checksumFinish(sum);if(protocol==IPPROTO_UDP&&result==0)result=0xffff;write16(transport+checksumOffset,result);
 }
-bool replay(const std::vector<Packet>& packets,pcap_t* dev,const Config& c,Stats& s){
+class PacketSource {
+public:
+    virtual ~PacketSource()=default;
+    virtual bool reset(std::string& error)=0;
+    virtual int next(Packet& packet,std::string& error)=0;
+};
+class MemorySource final:public PacketSource {
+    const std::vector<Packet>& packets_;size_t index_=0;
+public:
+    explicit MemorySource(const std::vector<Packet>& packets):packets_(packets){}
+    bool reset(std::string&)override{index_=0;return true;}
+    int next(Packet& packet,std::string&)override{if(index_>=packets_.size())return 0;packet=packets_[index_++];return 1;}
+};
+class FileSource final:public PacketSource {
+    const std::vector<std::string>& names_;size_t index_=0;pcap_t* file_=nullptr;
+    void close(){if(file_){pcap_close(file_);file_=nullptr;}}
+public:
+    explicit FileSource(const std::vector<std::string>& names):names_(names){}
+    ~FileSource(){close();}
+    bool reset(std::string&)override{close();index_=0;return true;}
+    int next(Packet& packet,std::string& error)override{
+        while(true){
+            if(!file_){if(index_>=names_.size())return 0;char err[PCAP_ERRBUF_SIZE]{};file_=pcap_open_offline(names_[index_].c_str(),err);if(!file_){error="Erreur de lecture de "+names_[index_]+": "+err;return -1;}++index_;}
+            pcap_pkthdr* header=nullptr;const u_char* bytes=nullptr;int result=pcap_next_ex(file_,&header,&bytes);
+            if(result==1){if(!header->caplen)continue;packet.bytes.assign(bytes,bytes+header->caplen);packet.ts=header->ts;return 1;}
+            if(result==-1){error=pcap_geterr(file_);close();return -1;}close();
+        }
+    }
+};
+bool replay(PacketSource& source,pcap_t* dev,const Config& c,Stats& s){
     auto deadline=c.duration>0?s.start+std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(c.duration)):std::chrono::steady_clock::time_point::max();
     auto target=std::chrono::steady_clock::now(),nextStats=c.statsEnabled&&c.statsInterval>0?target+std::chrono::seconds(c.statsInterval):std::chrono::steady_clock::time_point::max();
     auto lastSend=std::chrono::steady_clock::now();bool firstSend=true;
     std::mt19937_64 random(static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));std::uniform_real_distribution<double> chance(0.0,100.0);
-    for(uint64_t loop=0;(c.loops==0||loop<c.loops)&&!stopped;++loop){const Packet* previous=nullptr;uint64_t packetNumber=0;
-        for(const auto& original:packets){++packetNumber;if(!selected(c,packetNumber))continue;if(c.limit&&s.processed>=c.limit)return true;if(stopped||std::chrono::steady_clock::now()>=deadline)return true;double seconds=delay(c,original,previous);if(c.speed==Speed::Pps&&c.ppsMulti>1)seconds=(s.processed%c.ppsMulti==0)?double(c.ppsMulti)/c.rate:0.0;if(c.maxSleepMs)seconds=std::min(seconds,c.maxSleepMs/1000.0);target+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));waitUntil(std::min(target,deadline),c.timer);if(stopped||std::chrono::steady_clock::now()>=deadline)return true;
-            ++s.processed;if(c.lossPercent>0&&chance(random)<c.lossPercent){++s.dropped;previous=&original;continue;}if(c.oneAtATime){std::cout<<"Appuyez sur Entree pour envoyer le paquet "<<s.processed<<"..."<<std::flush;std::string line;std::getline(std::cin,line);}
+    for(uint64_t loop=0;(c.loops==0||loop<c.loops)&&!stopped;++loop){Packet previous{};bool hasPrevious=false,hasPackets=false;uint64_t packetNumber=0;std::string sourceError;if(!source.reset(sourceError)){std::cerr<<sourceError<<"\n";return false;}
+        while(true){Packet original;int read=source.next(original,sourceError);if(read<0){std::cerr<<sourceError<<"\n";return false;}if(read==0)break;hasPackets=true;++packetNumber;if(!selected(c,packetNumber))continue;if(c.limit&&s.processed>=c.limit)return true;if(stopped||std::chrono::steady_clock::now()>=deadline)return true;double seconds=delay(c,original,hasPrevious?&previous:nullptr);if(c.speed==Speed::Pps&&c.ppsMulti>1)seconds=(s.processed%c.ppsMulti==0)?double(c.ppsMulti)/c.rate:0.0;if(c.maxSleepMs)seconds=std::min(seconds,c.maxSleepMs/1000.0);target+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));waitUntil(std::min(target,deadline),c.timer);if(stopped||std::chrono::steady_clock::now()>=deadline)return true;
+            ++s.processed;if(c.lossPercent>0&&chance(random)<c.lossPercent){++s.dropped;previous.ts=original.ts;hasPrevious=true;continue;}if(c.oneAtATime){std::cout<<"Appuyez sur Entree pour envoyer le paquet "<<s.processed<<"..."<<std::flush;std::string line;std::getline(std::cin,line);}
             Packet p=original;rewrite(p,c);auto now=std::chrono::steady_clock::now();if(c.showDelta&&!firstSend)std::cout<<"Delta: "<<std::chrono::duration_cast<std::chrono::microseconds>(now-lastSend).count()<<" us\n";lastSend=now;firstSend=false;
-            if(pcap_sendpacket(dev,p.bytes.data(),(int)p.bytes.size())){++s.failed;std::cerr<<"Echec d'injection: "<<pcap_geterr(dev)<<"\n";return false;}++s.packets;s.bytes+=p.bytes.size();if(c.verbose)std::cout<<"packet "<<s.packets<<": "<<p.bytes.size()<<" octets\n";previous=&original;
+            if(pcap_sendpacket(dev,p.bytes.data(),(int)p.bytes.size())){++s.failed;std::cerr<<"Echec d'injection: "<<pcap_geterr(dev)<<"\n";return false;}++s.packets;s.bytes+=p.bytes.size();if(c.verbose)std::cout<<"packet "<<s.packets<<": "<<p.bytes.size()<<" octets\n";previous.ts=original.ts;hasPrevious=true;
             if(c.statsEnabled&&c.statsInterval>0&&now>=nextStats){double elapsed=std::chrono::duration<double>(now-s.start).count();std::cout<<"Progress: "<<s.packets<<" packets, "<<std::fixed<<std::setprecision(2)<<s.packets/std::max(elapsed,.000001)<<" pps\n";nextStats=now+std::chrono::seconds(c.statsInterval);}}
+        if(!hasPackets){std::cerr<<"Erreur: les captures ne contiennent aucun paquet\n";return false;}
         if(c.statsEnabled&&c.statsInterval==0)std::cout<<"Loop "<<(loop+1)<<": "<<s.packets<<" packets sent\n";
         if(c.loopDelayNs&&(c.loops==0||loop+1<c.loops)){target=std::chrono::steady_clock::now()+std::chrono::nanoseconds(c.loopDelayNs);waitUntil(target,c.timer);}
     }
@@ -236,6 +266,6 @@ int main(int argc,char** argv){
     std::vector<std::string> nics;if(!interfaces(nics,parsed==Parse::List))return 1;if(parsed==Parse::List)return 0;
     if(c.ifaceIndex>=0){if((size_t)c.ifaceIndex>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[c.ifaceIndex];}else{uint64_t i;if(uintValue(c.iface,i)){if(i>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[(size_t)i];}}
     if(c.printPid&&!c.quiet)std::cout<<"PID: "<<GetCurrentProcessId()<<"\n";
-    std::vector<Packet> packets;for(const auto& input:c.inputs)if(!load(input,packets,error)){std::cerr<<"Erreur de lecture de "<<input<<": "<<error<<"\n";return 1;}if(packets.empty()){std::cerr<<"Erreur: capture vide\n";return 1;}if(c.preload&&!c.quiet)std::cout<<"Preloaded "<<packets.size()<<" packets into memory\n";
-    char err[PCAP_ERRBUF_SIZE]{};auto dev=pcap_open_live(c.iface.c_str(),65535,0,1,err);if(!dev){std::cerr<<"Erreur d'ouverture: "<<err<<"\n";return 1;}SetConsoleCtrlHandler(control,TRUE);Stats s;s.start=std::chrono::steady_clock::now();bool ok=replay(packets,dev,c,s);stats(s);pcap_close(dev);return ok?0:1;
+    std::vector<Packet> packets;if(c.preload){for(const auto& input:c.inputs)if(!load(input,packets,error)){std::cerr<<"Erreur de lecture de "<<input<<": "<<error<<"\n";return 1;}if(packets.empty()){std::cerr<<"Erreur: capture vide\n";return 1;}if(!c.quiet)std::cout<<"Preloaded "<<packets.size()<<" packets into memory\n";}
+    char err[PCAP_ERRBUF_SIZE]{};auto dev=pcap_open_live(c.iface.c_str(),65535,0,1,err);if(!dev){std::cerr<<"Erreur d'ouverture: "<<err<<"\n";return 1;}SetConsoleCtrlHandler(control,TRUE);Stats s;s.start=std::chrono::steady_clock::now();bool ok=false;if(c.preload){MemorySource source(packets);ok=replay(source,dev,c,s);}else{FileSource source(c.inputs);ok=replay(source,dev,c,s);}stats(s);pcap_close(dev);return ok?0:1;
 }
