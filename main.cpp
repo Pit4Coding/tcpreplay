@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -25,6 +27,7 @@ struct PacketRange { uint64_t first=0,last=0; };
 struct Config {
     std::vector<std::string> inputs;
     std::string iface, iface2;
+    std::string cacheFile;
     std::string srcIp, dstIp;
     int ifaceIndex = -1;
     int sourcePort = -1, destinationPort = -1;
@@ -38,6 +41,8 @@ struct Config {
     uint64_t ppsMulti = 1, statsInterval = 0;
     std::vector<PacketRange> selection;
     bool includeSelection = false, excludeSelection = false;
+    uint64_t cachePackets = 0;
+    std::vector<unsigned char> cacheData;
 };
 struct Packet { std::vector<unsigned char> bytes; timeval ts{}; int output=0; };
 struct Stats { uint64_t packets=0, bytes=0, failed=0, dropped=0, processed=0; std::chrono::steady_clock::time_point start; };
@@ -50,6 +55,7 @@ void help() {
         "Interface:\n  -i, --intf1 <name|index>  interface Npcap de sortie\n"
         "  -I, --intf2 <name|index>  seconde interface de sortie\n"
         "  -2, --dualfile           fusionne deux captures directionnelles\n"
+        "  -c, --cachefile <fichier> repartit via un cache tcpprep v04\n"
         "      --listnics           liste les interfaces\n\n"
         "Vitesse (mutuellement exclusive):\n"
         "  -t, --topspeed           vitesse maximale\n"
@@ -122,6 +128,7 @@ Parse parse(int argc, char** argv, Config& c, std::string& error) {
         if (a=="-i" || a=="--intf1" || a=="--iface") { auto v=next(); if(!v)return Parse::Error; c.iface=v; continue; }
         if (a=="-I" || a=="--intf2") { auto v=next(); if(!v)return Parse::Error; c.iface2=v; continue; }
         if (a=="-2" || a=="--dualfile") { c.dualFile=true; continue; }
+        if (a=="-c" || a=="--cachefile") { auto v=next();if(!v)return Parse::Error;c.cacheFile=v;continue; }
         if (a=="--iface-index") { auto v=next(); uint64_t n; if(!v)return Parse::Error; if(!uintValue(v,n)||n>INT_MAX){error="index invalide";return Parse::Error;} c.ifaceIndex=(int)n; continue; }
         if (a=="-l" || a=="--loop") { auto v=next(); if(!v)return Parse::Error; if(!uintValue(v,c.loops)){error="boucles invalides";return Parse::Error;} continue; }
         if (a=="--duration") { auto v=next(); if(!v)return Parse::Error; if(!doubleValue(v,c.duration)){error="duree invalide";return Parse::Error;} continue; }
@@ -164,6 +171,7 @@ Parse parse(int argc, char** argv, Config& c, std::string& error) {
     if(c.ppsMulti!=1&&c.speed!=Speed::Pps){error="--pps-multi exige --pps";return Parse::Error;}
     if(c.quiet&&(c.verbose||c.showDelta)){error="--quiet est incompatible avec --verbose et --show-delta";return Parse::Error;}
     if(c.dualFile&&(c.inputs.size()!=2||c.iface2.empty())){error="--dualfile exige exactement deux captures et --intf2";return Parse::Error;}
+    if(!c.cacheFile.empty()&&(c.iface2.empty()||c.inputs.size()!=1||c.dualFile)){error="--cachefile exige une capture, --intf2 et exclut --dualfile";return Parse::Error;}
     return Parse::Run;
 }
 bool interfaces(std::vector<std::string>& names, bool display) {
@@ -178,6 +186,20 @@ bool load(const std::string& name, std::vector<Packet>& packets, std::string& er
     while((r=pcap_next_ex(file,&h,&b))==1) if(h->caplen) packets.push_back({{b,b+h->caplen},h->ts,output});
     if(r==-1)error=pcap_geterr(file); pcap_close(file); return r!=-1;
 }
+uint64_t read64be(const unsigned char* p){uint64_t value=0;for(int i=0;i<8;++i)value=(value<<8)|p[i];return value;}
+bool loadCache(Config& c,std::string& error){
+    std::ifstream file(c.cacheFile,std::ios::binary);if(!file){error="impossible d'ouvrir le cache "+c.cacheFile;return false;}
+    unsigned char header[24]{};if(!file.read(reinterpret_cast<char*>(header),sizeof(header))){error="en-tete de cache tcpprep incomplet";return false;}
+    const unsigned char magic[8]={'t','c','p','p','r','e','p',0};if(std::memcmp(header,magic,8)!=0){error="fichier non reconnu comme cache tcpprep";return false;}
+    if(header[8]!='0'||header[9]!='4'){error="version de cache tcpprep non prise en charge (version 04 requise)";return false;}
+    c.cachePackets=read64be(header+12);uint16_t packetsPerByte=uint16_t(header[20])<<8|header[21],commentLength=uint16_t(header[22])<<8|header[23];
+    if(packetsPerByte!=4){error="cache tcpprep invalide: packets_per_byte doit valoir 4";return false;}
+    if(c.cachePackets>UINT64_MAX-3){error="cache tcpprep trop volumineux";return false;}
+    file.seekg(commentLength,std::ios::cur);if(!file){error="commentaire de cache tcpprep tronque";return false;}
+    size_t bytes=static_cast<size_t>((c.cachePackets+3)/4);c.cacheData.resize(bytes);if(bytes&&!file.read(reinterpret_cast<char*>(c.cacheData.data()),static_cast<std::streamsize>(bytes))){error="donnees de cache tcpprep tronquees";return false;}
+    char extra;if(file.read(&extra,1)){error="donnees superflues apres le cache tcpprep";return false;}return true;
+}
+int cacheDirection(const Config& c,uint64_t packetNumber){if(packetNumber==0||packetNumber>c.cachePackets)return -1;uint64_t zero=packetNumber-1;unsigned char byte=c.cacheData[static_cast<size_t>(zero/4)];unsigned bit=static_cast<unsigned>((zero%4)*2+1);if(!(byte&(1u<<bit)))return -1;return (byte&(1u<<(bit-1)))?0:1;}
 uint64_t delta(const timeval& a,const timeval& b){int64_t d=(int64_t(a.tv_sec)-b.tv_sec)*1000000LL+a.tv_usec-b.tv_usec;return d>0?(uint64_t)d:0;}
 void waitUntil(std::chrono::steady_clock::time_point target,TimerMode mode){
     if(mode==TimerMode::Select){while(!stopped){auto now=std::chrono::steady_clock::now();if(now>=target)return;std::this_thread::sleep_for(std::min(target-now,std::chrono::steady_clock::duration(std::chrono::milliseconds(1))));}return;}
@@ -262,12 +284,12 @@ bool replay(PacketSource& source,pcap_t* dev,pcap_t* dev2,const Config& c,Stats&
     auto lastSend=std::chrono::steady_clock::now();bool firstSend=true;
     std::mt19937_64 random(static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));std::uniform_real_distribution<double> chance(0.0,100.0);
     for(uint64_t loop=0;(c.loops==0||loop<c.loops)&&!stopped;++loop){Packet previous{};bool hasPrevious=false,hasPackets=false;uint64_t packetNumber=0;std::string sourceError;if(!source.reset(sourceError)){std::cerr<<sourceError<<"\n";return false;}
-        while(true){Packet original;int read=source.next(original,sourceError);if(read<0){std::cerr<<sourceError<<"\n";return false;}if(read==0)break;hasPackets=true;++packetNumber;if(!selected(c,packetNumber))continue;if(c.limit&&s.processed>=c.limit)return true;if(stopped||std::chrono::steady_clock::now()>=deadline)return true;double seconds=delay(c,original,hasPrevious?&previous:nullptr);if(c.speed==Speed::Pps&&c.ppsMulti>1)seconds=(s.processed%c.ppsMulti==0)?double(c.ppsMulti)/c.rate:0.0;if(c.maxSleepMs)seconds=std::min(seconds,c.maxSleepMs/1000.0);target+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));waitUntil(std::min(target,deadline),c.timer);if(stopped||std::chrono::steady_clock::now()>=deadline)return true;
+        while(true){Packet original;int read=source.next(original,sourceError);if(read<0){std::cerr<<sourceError<<"\n";return false;}if(read==0)break;hasPackets=true;++packetNumber;if(!c.cacheFile.empty()){if(packetNumber>c.cachePackets){std::cerr<<"Erreur: la capture contient plus de paquets que le cache tcpprep\n";return false;}int direction=cacheDirection(c,packetNumber);if(direction<0)continue;original.output=direction;}if(!selected(c,packetNumber))continue;if(c.limit&&s.processed>=c.limit)return true;if(stopped||std::chrono::steady_clock::now()>=deadline)return true;double seconds=delay(c,original,hasPrevious?&previous:nullptr);if(c.speed==Speed::Pps&&c.ppsMulti>1)seconds=(s.processed%c.ppsMulti==0)?double(c.ppsMulti)/c.rate:0.0;if(c.maxSleepMs)seconds=std::min(seconds,c.maxSleepMs/1000.0);target+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));waitUntil(std::min(target,deadline),c.timer);if(stopped||std::chrono::steady_clock::now()>=deadline)return true;
             ++s.processed;if(c.lossPercent>0&&chance(random)<c.lossPercent){++s.dropped;previous.ts=original.ts;hasPrevious=true;continue;}if(c.oneAtATime){std::cout<<"Appuyez sur Entree pour envoyer le paquet "<<s.processed<<"..."<<std::flush;std::string line;std::getline(std::cin,line);}
             Packet p=original;rewrite(p,c);auto now=std::chrono::steady_clock::now();if(c.showDelta&&!firstSend)std::cout<<"Delta: "<<std::chrono::duration_cast<std::chrono::microseconds>(now-lastSend).count()<<" us\n";lastSend=now;firstSend=false;
             pcap_t* output=p.output==1&&dev2?dev2:dev;if(pcap_sendpacket(output,p.bytes.data(),(int)p.bytes.size())){++s.failed;std::cerr<<"Echec d'injection: "<<pcap_geterr(output)<<"\n";return false;}++s.packets;s.bytes+=p.bytes.size();if(c.verbose)std::cout<<"packet "<<s.packets<<" -> intf"<<(p.output+1)<<": "<<p.bytes.size()<<" octets\n";previous.ts=original.ts;hasPrevious=true;
             if(c.statsEnabled&&c.statsInterval>0&&now>=nextStats){double elapsed=std::chrono::duration<double>(now-s.start).count();std::cout<<"Progress: "<<s.packets<<" packets, "<<std::fixed<<std::setprecision(2)<<s.packets/std::max(elapsed,.000001)<<" pps\n";nextStats=now+std::chrono::seconds(c.statsInterval);}}
-        if(!hasPackets){std::cerr<<"Erreur: les captures ne contiennent aucun paquet\n";return false;}
+        if(!hasPackets){std::cerr<<"Erreur: les captures ne contiennent aucun paquet\n";return false;}if(!c.cacheFile.empty()&&packetNumber!=c.cachePackets){std::cerr<<"Erreur: le cache tcpprep contient "<<c.cachePackets<<" decisions pour "<<packetNumber<<" paquets\n";return false;}
         if(c.statsEnabled&&c.statsInterval==0)std::cout<<"Loop "<<(loop+1)<<": "<<s.packets<<" packets sent\n";
         if(c.loopDelayNs&&(c.loops==0||loop+1<c.loops)){target=std::chrono::steady_clock::now()+std::chrono::nanoseconds(c.loopDelayNs);waitUntil(target,c.timer);}
     }
@@ -281,6 +303,7 @@ int main(int argc,char** argv){
     std::vector<std::string> nics;if(!interfaces(nics,parsed==Parse::List))return 1;if(parsed==Parse::List)return 0;
     if(c.ifaceIndex>=0){if((size_t)c.ifaceIndex>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[c.ifaceIndex];}else{uint64_t i;if(uintValue(c.iface,i)){if(i>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[(size_t)i];}}
     if(!c.iface2.empty()){uint64_t i;if(uintValue(c.iface2,i)){if(i>=nics.size()){std::cerr<<"Erreur: index de seconde interface hors limites\n";return 1;}c.iface2=nics[(size_t)i];}}
+    if(!c.cacheFile.empty()&&!loadCache(c,error)){std::cerr<<"Erreur: "<<error<<"\n";return 1;}
     if(c.printPid&&!c.quiet)std::cout<<"PID: "<<GetCurrentProcessId()<<"\n";
     std::vector<Packet> packets;if(c.preload){if(c.dualFile){if(!load(c.inputs[0],packets,error,0)||!load(c.inputs[1],packets,error,1)){std::cerr<<"Erreur de lecture: "<<error<<"\n";return 1;}std::stable_sort(packets.begin(),packets.end(),[](const Packet& a,const Packet& b){return a.ts.tv_sec<b.ts.tv_sec||(a.ts.tv_sec==b.ts.tv_sec&&a.ts.tv_usec<b.ts.tv_usec);});}else for(const auto& input:c.inputs)if(!load(input,packets,error)){std::cerr<<"Erreur de lecture de "<<input<<": "<<error<<"\n";return 1;}if(packets.empty()){std::cerr<<"Erreur: capture vide\n";return 1;}if(!c.quiet)std::cout<<"Preloaded "<<packets.size()<<" packets into memory\n";}
     char err[PCAP_ERRBUF_SIZE]{};auto dev=pcap_open_live(c.iface.c_str(),65535,0,1,err);if(!dev){std::cerr<<"Erreur d'ouverture: "<<err<<"\n";return 1;}pcap_t* dev2=nullptr;if(!c.iface2.empty()){dev2=pcap_open_live(c.iface2.c_str(),65535,0,1,err);if(!dev2){std::cerr<<"Erreur d'ouverture de la seconde interface: "<<err<<"\n";pcap_close(dev);return 1;}}
