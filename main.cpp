@@ -21,8 +21,10 @@ constexpr const char* VERSION = "4.6.0-win.1";
 std::atomic_bool stopped{false};
 enum class Speed { Timed, Top, Pps, Mbps, Multiplier };
 enum class TimerMode { Hybrid, Select, Gtod, Nano, Ioport };
+struct PacketRange { uint64_t first=0,last=0; };
 struct Config {
-    std::string input, iface;
+    std::vector<std::string> inputs;
+    std::string iface;
     std::string srcIp, dstIp;
     int ifaceIndex = -1;
     int sourcePort = -1, destinationPort = -1;
@@ -34,6 +36,8 @@ struct Config {
     double lossPercent = 0.0;
     uint64_t loops = 1, limit = 0, loopDelayNs = 0, maxSleepMs = 0;
     uint64_t ppsMulti = 1, statsInterval = 0;
+    std::vector<PacketRange> selection;
+    bool includeSelection = false, excludeSelection = false;
 };
 struct Packet { std::vector<unsigned char> bytes; timeval ts{}; };
 struct Stats { uint64_t packets=0, bytes=0, failed=0, dropped=0, processed=0; std::chrono::steady_clock::time_point start; };
@@ -42,7 +46,7 @@ void version() { std::cout << "tcpreplay version " << VERSION << " (Windows nati
 void help() {
     version();
     std::cout <<
-        "Usage: tcpreplay.exe [options] <capture.pcap>\n\n"
+        "Usage: tcpreplay.exe [options] <capture1.pcap> [capture2.pcap ...]\n\n"
         "Interface:\n  -i, --intf1 <name|index>  interface Npcap de sortie\n"
         "      --listnics           liste les interfaces\n\n"
         "Vitesse (mutuellement exclusive):\n"
@@ -64,6 +68,8 @@ void help() {
         "  -P, --pid                affiche le PID au demarrage\n"
         "      --stats <sec>        statistiques periodiques\n"
         "  -W, --suppress-warnings  masque les avertissements\n"
+        "      --include <liste>    envoie seulement les numeros selectionnes\n"
+        "      --exclude <liste>    exclut les numeros selectionnes\n"
         "  -K, --preload-pcap       prechargement en memoire\n"
         "      --src-ip <adresse>   reecrit l'adresse IPv4 source\n"
         "      --dst-ip <adresse>   reecrit l'adresse IPv4 destination\n"
@@ -87,6 +93,14 @@ bool speed(Config& c, Speed s, double rate, std::string& error) {
     if (c.speed != Speed::Timed) { error="une seule option de vitesse est permise"; return false; }
     c.speed=s; c.rate=rate; return true;
 }
+bool parseSelection(std::string text,std::vector<PacketRange>& ranges){
+    if(text.rfind("P:",0)==0||text.rfind("p:",0)==0)text=text.substr(2);if(text.empty())return false;
+    size_t begin=0;while(begin<text.size()){size_t comma=text.find(',',begin);std::string part=text.substr(begin,comma==std::string::npos?std::string::npos:comma-begin);if(part.empty())return false;size_t dash=part.find('-');uint64_t first=0,last=0;
+        if(dash==std::string::npos){if(!uintValue(part,first)||first==0)return false;last=first;}else{std::string left=part.substr(0,dash),right=part.substr(dash+1);if(!uintValue(left,first)||first==0)return false;if(right.empty())last=UINT64_MAX;else if(!uintValue(right,last)||last<first)return false;}
+        ranges.push_back({first,last});if(comma==std::string::npos)break;begin=comma+1;}
+    return true;
+}
+bool selected(const Config& c,uint64_t number){bool match=false;for(const auto& range:c.selection)if(number>=range.first&&number<=range.last){match=true;break;}return c.includeSelection?match:c.excludeSelection?!match:true;}
 enum class Parse { Run, Exit, List, Error };
 Parse parse(int argc, char** argv, Config& c, std::string& error) {
     for (int i=1; i<argc; ++i) {
@@ -113,6 +127,7 @@ Parse parse(int argc, char** argv, Config& c, std::string& error) {
             if(a=="-L"||a=="--limit")c.limit=n;else if(a=="--maxsleep")c.maxSleepMs=n;else if(a=="--loopdelay-ms"){if(n>UINT64_MAX/1000000ULL){error="delai de boucle trop grand";return Parse::Error;}c.loopDelayNs=n*1000000ULL;}else if(a=="--loopdelay-ns")c.loopDelayNs=n;else if(a=="--pps-multi"){if(n==0){error="--pps-multi doit etre superieur a zero";return Parse::Error;}c.ppsMulti=n;}else {c.statsInterval=n;c.statsEnabled=true;}continue;
         }
         if (a=="--loss") { auto v=next();if(!v)return Parse::Error;char* e=nullptr;errno=0;c.lossPercent=std::strtod(v,&e);if(errno||!e||*e||!std::isfinite(c.lossPercent)||c.lossPercent<0||c.lossPercent>100){error="--loss doit etre compris entre 0 et 100";return Parse::Error;}continue; }
+        if (a=="--include" || a=="--exclude") { auto v=next();if(!v)return Parse::Error;if(c.includeSelection||c.excludeSelection){error="--include et --exclude sont mutuellement exclusifs";return Parse::Error;}if(!parseSelection(v,c.selection)){error="selection de paquets invalide: "+std::string(v);return Parse::Error;}c.includeSelection=a=="--include";c.excludeSelection=a=="--exclude";continue; }
         if (a=="--src-ip" || a=="--dst-ip") {
             auto v=next(); if(!v)return Parse::Error; in_addr address{};
             if(inet_pton(AF_INET,v,&address)!=1){error="adresse IPv4 invalide: "+std::string(v);return Parse::Error;}
@@ -138,10 +153,9 @@ Parse parse(int argc, char** argv, Config& c, std::string& error) {
             if(!speed(c,mode,n,error))return Parse::Error; continue;
         }
         if (!a.empty() && a[0]=='-') { error="option inconnue: "+a; return Parse::Error; }
-        if (!c.input.empty()) { error="plusieurs fichiers d'entree"; return Parse::Error; }
-        c.input=a;
+        c.inputs.push_back(a);
     }
-    if(c.input.empty()){error="fichier d'entree manquant";return Parse::Error;}
+    if(c.inputs.empty()){error="fichier d'entree manquant";return Parse::Error;}
     if(c.iface.empty()&&c.ifaceIndex<0){error="interface manquante (-i/--intf1)";return Parse::Error;}
     if(c.ppsMulti!=1&&c.speed!=Speed::Pps){error="--pps-multi exige --pps";return Parse::Error;}
     if(c.quiet&&(c.verbose||c.showDelta)){error="--quiet est incompatible avec --verbose et --show-delta";return Parse::Error;}
@@ -203,8 +217,8 @@ bool replay(const std::vector<Packet>& packets,pcap_t* dev,const Config& c,Stats
     auto target=std::chrono::steady_clock::now(),nextStats=c.statsEnabled&&c.statsInterval>0?target+std::chrono::seconds(c.statsInterval):std::chrono::steady_clock::time_point::max();
     auto lastSend=std::chrono::steady_clock::now();bool firstSend=true;
     std::mt19937_64 random(static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));std::uniform_real_distribution<double> chance(0.0,100.0);
-    for(uint64_t loop=0;(c.loops==0||loop<c.loops)&&!stopped;++loop){const Packet* previous=nullptr;
-        for(const auto& original:packets){if(c.limit&&s.processed>=c.limit)return true;if(stopped||std::chrono::steady_clock::now()>=deadline)return true;double seconds=delay(c,original,previous);if(c.speed==Speed::Pps&&c.ppsMulti>1)seconds=(s.processed%c.ppsMulti==0)?double(c.ppsMulti)/c.rate:0.0;if(c.maxSleepMs)seconds=std::min(seconds,c.maxSleepMs/1000.0);target+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));waitUntil(std::min(target,deadline),c.timer);if(stopped||std::chrono::steady_clock::now()>=deadline)return true;
+    for(uint64_t loop=0;(c.loops==0||loop<c.loops)&&!stopped;++loop){const Packet* previous=nullptr;uint64_t packetNumber=0;
+        for(const auto& original:packets){++packetNumber;if(!selected(c,packetNumber))continue;if(c.limit&&s.processed>=c.limit)return true;if(stopped||std::chrono::steady_clock::now()>=deadline)return true;double seconds=delay(c,original,previous);if(c.speed==Speed::Pps&&c.ppsMulti>1)seconds=(s.processed%c.ppsMulti==0)?double(c.ppsMulti)/c.rate:0.0;if(c.maxSleepMs)seconds=std::min(seconds,c.maxSleepMs/1000.0);target+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));waitUntil(std::min(target,deadline),c.timer);if(stopped||std::chrono::steady_clock::now()>=deadline)return true;
             ++s.processed;if(c.lossPercent>0&&chance(random)<c.lossPercent){++s.dropped;previous=&original;continue;}if(c.oneAtATime){std::cout<<"Appuyez sur Entree pour envoyer le paquet "<<s.processed<<"..."<<std::flush;std::string line;std::getline(std::cin,line);}
             Packet p=original;rewrite(p,c);auto now=std::chrono::steady_clock::now();if(c.showDelta&&!firstSend)std::cout<<"Delta: "<<std::chrono::duration_cast<std::chrono::microseconds>(now-lastSend).count()<<" us\n";lastSend=now;firstSend=false;
             if(pcap_sendpacket(dev,p.bytes.data(),(int)p.bytes.size())){++s.failed;std::cerr<<"Echec d'injection: "<<pcap_geterr(dev)<<"\n";return false;}++s.packets;s.bytes+=p.bytes.size();if(c.verbose)std::cout<<"packet "<<s.packets<<": "<<p.bytes.size()<<" octets\n";previous=&original;
@@ -222,6 +236,6 @@ int main(int argc,char** argv){
     std::vector<std::string> nics;if(!interfaces(nics,parsed==Parse::List))return 1;if(parsed==Parse::List)return 0;
     if(c.ifaceIndex>=0){if((size_t)c.ifaceIndex>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[c.ifaceIndex];}else{uint64_t i;if(uintValue(c.iface,i)){if(i>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[(size_t)i];}}
     if(c.printPid&&!c.quiet)std::cout<<"PID: "<<GetCurrentProcessId()<<"\n";
-    std::vector<Packet> packets;if(!load(c.input,packets,error)){std::cerr<<"Erreur de lecture: "<<error<<"\n";return 1;}if(packets.empty()){std::cerr<<"Erreur: capture vide\n";return 1;}if(c.preload&&!c.quiet)std::cout<<"Preloaded "<<packets.size()<<" packets into memory\n";
+    std::vector<Packet> packets;for(const auto& input:c.inputs)if(!load(input,packets,error)){std::cerr<<"Erreur de lecture de "<<input<<": "<<error<<"\n";return 1;}if(packets.empty()){std::cerr<<"Erreur: capture vide\n";return 1;}if(c.preload&&!c.quiet)std::cout<<"Preloaded "<<packets.size()<<" packets into memory\n";
     char err[PCAP_ERRBUF_SIZE]{};auto dev=pcap_open_live(c.iface.c_str(),65535,0,1,err);if(!dev){std::cerr<<"Erreur d'ouverture: "<<err<<"\n";return 1;}SetConsoleCtrlHandler(control,TRUE);Stats s;s.start=std::chrono::steady_clock::now();bool ok=replay(packets,dev,c,s);stats(s);pcap_close(dev);return ok?0:1;
 }
