@@ -21,6 +21,7 @@
 namespace {
 #pragma comment(lib, "ws2_32.lib")
 constexpr const char* VERSION = "4.6.0-win.1";
+std::string programName = "tcpreplay";
 std::atomic_bool stopped{false};
 enum class Speed { Timed, Top, Pps, Mbps, Multiplier };
 enum class TimerMode { Hybrid, Select, Gtod, Nano, Ioport };
@@ -46,11 +47,11 @@ struct Config {
 };
 struct Stats { uint64_t packets=0, bytes=0, failed=0, dropped=0, processed=0; std::chrono::steady_clock::time_point start; };
 
-void version() { std::cout << "tcpreplay version " << VERSION << " (Windows native, Npcap)\n"; }
+void version() { std::cout << programName << " version " << VERSION << " (Windows native, Npcap)\n"; }
 void help() {
     version();
     std::cout <<
-        "Usage: tcpreplay.exe [options] <capture1.pcap> [capture2.pcap ...]\n\n"
+        "Usage: " << programName << ".exe [options] <capture1.pcap> [capture2.pcap ...]\n\n"
         "Interface:\n  -i, --intf1 <name|index>  interface Npcap de sortie\n"
         "  -I, --intf2 <name|index>  seconde interface de sortie\n"
         "  -2, --dualfile           fusionne deux captures directionnelles\n"
@@ -215,6 +216,7 @@ BOOL WINAPI control(DWORD type){if(type==CTRL_C_EVENT||type==CTRL_BREAK_EVENT||t
 void stats(const Stats& s){double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-s.start).count(),safe=std::max(elapsed,.000001);std::cout<<std::fixed<<std::setprecision(2)<<"Actual: "<<s.packets<<" packets ("<<s.bytes<<" bytes) sent in "<<elapsed<<" seconds\nRated: "<<s.packets/safe<<" pps, "<<s.bytes*8.0/safe/1000000.0<<" Mbps\nFailed write attempts: "<<s.failed<<"\nPackets dropped by --loss: "<<s.dropped<<"\n";}
 }
 int main(int argc,char** argv){
+    if(argc>0&&argv[0]){programName=argv[0];size_t slash=programName.find_last_of("\\/");if(slash!=std::string::npos)programName=programName.substr(slash+1);if(programName.size()>4&&programName.substr(programName.size()-4)==".exe")programName.resize(programName.size()-4);}
     Config c;std::string error;auto parsed=parse(argc,argv,c,error);if(parsed==Parse::Exit)return 0;if(parsed==Parse::Error){std::cerr<<"Erreur: "<<error<<"\nUtilisez --help pour l'aide.\n";return 1;}
     std::vector<std::string> nics;if(parsed==Parse::List){if(!interfaces(nics,true))return 1;return 0;}if(c.outputFile.empty()){if(!interfaces(nics,false))return 1;if(c.ifaceIndex>=0){if((size_t)c.ifaceIndex>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[c.ifaceIndex];}else{uint64_t i;if(uintValue(c.iface,i)){if(i>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[(size_t)i];}}if(!c.iface2.empty()){uint64_t i;if(uintValue(c.iface2,i)){if(i>=nics.size()){std::cerr<<"Erreur: index de seconde interface hors limites\n";return 1;}c.iface2=nics[(size_t)i];}}}
     if(!c.cacheFile.empty()&&!loadTcpprepCache(c.cacheFile,c.cache,error)){std::cerr<<"Erreur: "<<error<<"\n";return 1;}
