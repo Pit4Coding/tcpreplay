@@ -1,0 +1,27 @@
+# Visual Studio state and build products
+.vs/
+Debug/
+Release/
+x64/
+Win32/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.tlog
+
+# CMake build trees
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Local captures and generated output
+*.pcap
+*.pcapng
+*.cache
