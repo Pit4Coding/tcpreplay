@@ -28,6 +28,7 @@ struct Config {
     std::vector<std::string> inputs;
     std::string iface, iface2;
     std::string cacheFile;
+    std::string outputFile;
     std::string srcIp, dstIp;
     int ifaceIndex = -1;
     int sourcePort = -1, destinationPort = -1;
@@ -56,6 +57,7 @@ void help() {
         "  -I, --intf2 <name|index>  seconde interface de sortie\n"
         "  -2, --dualfile           fusionne deux captures directionnelles\n"
         "  -c, --cachefile <fichier> repartit via un cache tcpprep v04\n"
+        "  -w, --write <fichier>    ecrit les paquets dans un PCAP\n"
         "      --listnics           liste les interfaces\n\n"
         "Vitesse (mutuellement exclusive):\n"
         "  -t, --topspeed           vitesse maximale\n"
@@ -129,6 +131,7 @@ Parse parse(int argc, char** argv, Config& c, std::string& error) {
         if (a=="-I" || a=="--intf2") { auto v=next(); if(!v)return Parse::Error; c.iface2=v; continue; }
         if (a=="-2" || a=="--dualfile") { c.dualFile=true; continue; }
         if (a=="-c" || a=="--cachefile") { auto v=next();if(!v)return Parse::Error;c.cacheFile=v;continue; }
+        if (a=="-w" || a=="--write") { auto v=next();if(!v)return Parse::Error;c.outputFile=v;continue; }
         if (a=="--iface-index") { auto v=next(); uint64_t n; if(!v)return Parse::Error; if(!uintValue(v,n)||n>INT_MAX){error="index invalide";return Parse::Error;} c.ifaceIndex=(int)n; continue; }
         if (a=="-l" || a=="--loop") { auto v=next(); if(!v)return Parse::Error; if(!uintValue(v,c.loops)){error="boucles invalides";return Parse::Error;} continue; }
         if (a=="--duration") { auto v=next(); if(!v)return Parse::Error; if(!doubleValue(v,c.duration)){error="duree invalide";return Parse::Error;} continue; }
@@ -167,11 +170,12 @@ Parse parse(int argc, char** argv, Config& c, std::string& error) {
         c.inputs.push_back(a);
     }
     if(c.inputs.empty()){error="fichier d'entree manquant";return Parse::Error;}
-    if(c.iface.empty()&&c.ifaceIndex<0){error="interface manquante (-i/--intf1)";return Parse::Error;}
+    if(c.outputFile.empty()&&c.iface.empty()&&c.ifaceIndex<0){error="interface manquante (-i/--intf1)";return Parse::Error;}
     if(c.ppsMulti!=1&&c.speed!=Speed::Pps){error="--pps-multi exige --pps";return Parse::Error;}
     if(c.quiet&&(c.verbose||c.showDelta)){error="--quiet est incompatible avec --verbose et --show-delta";return Parse::Error;}
     if(c.dualFile&&(c.inputs.size()!=2||c.iface2.empty())){error="--dualfile exige exactement deux captures et --intf2";return Parse::Error;}
     if(!c.cacheFile.empty()&&(c.iface2.empty()||c.inputs.size()!=1||c.dualFile)){error="--cachefile exige une capture, --intf2 et exclut --dualfile";return Parse::Error;}
+    if(!c.outputFile.empty()&&(!c.iface2.empty()||!c.cacheFile.empty()||c.dualFile)){error="--write est incompatible avec --intf2, --cachefile et --dualfile";return Parse::Error;}
     return Parse::Run;
 }
 bool interfaces(std::vector<std::string>& names, bool display) {
@@ -278,7 +282,7 @@ public:
     bool reset(std::string& error)override{close();for(int side=0;side<2;++side){char err[PCAP_ERRBUF_SIZE]{};files_[side]=pcap_open_offline(names_[side].c_str(),err);if(!files_[side]){error="Erreur de lecture de "+names_[side]+": "+err;close();return false;}ready_[side]=eof_[side]=false;}return true;}
     int next(Packet& packet,std::string& error)override{if(!fill(0,error)||!fill(1,error))return -1;if(!ready_[0]&&!ready_[1])return 0;int side;if(!ready_[1])side=0;else if(!ready_[0])side=1;else side=(pending_[0].ts.tv_sec<pending_[1].ts.tv_sec||(pending_[0].ts.tv_sec==pending_[1].ts.tv_sec&&pending_[0].ts.tv_usec<=pending_[1].ts.tv_usec))?0:1;packet=std::move(pending_[side]);ready_[side]=false;return 1;}
 };
-bool replay(PacketSource& source,pcap_t* dev,pcap_t* dev2,const Config& c,Stats& s){
+bool replay(PacketSource& source,pcap_t* dev,pcap_t* dev2,pcap_dumper_t* dumper,const Config& c,Stats& s){
     auto deadline=c.duration>0?s.start+std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(c.duration)):std::chrono::steady_clock::time_point::max();
     auto target=std::chrono::steady_clock::now(),nextStats=c.statsEnabled&&c.statsInterval>0?target+std::chrono::seconds(c.statsInterval):std::chrono::steady_clock::time_point::max();
     auto lastSend=std::chrono::steady_clock::now();bool firstSend=true;
@@ -287,7 +291,7 @@ bool replay(PacketSource& source,pcap_t* dev,pcap_t* dev2,const Config& c,Stats&
         while(true){Packet original;int read=source.next(original,sourceError);if(read<0){std::cerr<<sourceError<<"\n";return false;}if(read==0)break;hasPackets=true;++packetNumber;if(!c.cacheFile.empty()){if(packetNumber>c.cachePackets){std::cerr<<"Erreur: la capture contient plus de paquets que le cache tcpprep\n";return false;}int direction=cacheDirection(c,packetNumber);if(direction<0)continue;original.output=direction;}if(!selected(c,packetNumber))continue;if(c.limit&&s.processed>=c.limit)return true;if(stopped||std::chrono::steady_clock::now()>=deadline)return true;double seconds=delay(c,original,hasPrevious?&previous:nullptr);if(c.speed==Speed::Pps&&c.ppsMulti>1)seconds=(s.processed%c.ppsMulti==0)?double(c.ppsMulti)/c.rate:0.0;if(c.maxSleepMs)seconds=std::min(seconds,c.maxSleepMs/1000.0);target+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));waitUntil(std::min(target,deadline),c.timer);if(stopped||std::chrono::steady_clock::now()>=deadline)return true;
             ++s.processed;if(c.lossPercent>0&&chance(random)<c.lossPercent){++s.dropped;previous.ts=original.ts;hasPrevious=true;continue;}if(c.oneAtATime){std::cout<<"Appuyez sur Entree pour envoyer le paquet "<<s.processed<<"..."<<std::flush;std::string line;std::getline(std::cin,line);}
             Packet p=original;rewrite(p,c);auto now=std::chrono::steady_clock::now();if(c.showDelta&&!firstSend)std::cout<<"Delta: "<<std::chrono::duration_cast<std::chrono::microseconds>(now-lastSend).count()<<" us\n";lastSend=now;firstSend=false;
-            pcap_t* output=p.output==1&&dev2?dev2:dev;if(pcap_sendpacket(output,p.bytes.data(),(int)p.bytes.size())){++s.failed;std::cerr<<"Echec d'injection: "<<pcap_geterr(output)<<"\n";return false;}++s.packets;s.bytes+=p.bytes.size();if(c.verbose)std::cout<<"packet "<<s.packets<<" -> intf"<<(p.output+1)<<": "<<p.bytes.size()<<" octets\n";previous.ts=original.ts;hasPrevious=true;
+            if(dumper){pcap_pkthdr header{};header.ts=p.ts;header.caplen=header.len=static_cast<bpf_u_int32>(p.bytes.size());pcap_dump(reinterpret_cast<u_char*>(dumper),&header,p.bytes.data());}else{pcap_t* output=p.output==1&&dev2?dev2:dev;if(pcap_sendpacket(output,p.bytes.data(),(int)p.bytes.size())){++s.failed;std::cerr<<"Echec d'injection: "<<pcap_geterr(output)<<"\n";return false;}}++s.packets;s.bytes+=p.bytes.size();if(c.verbose)std::cout<<"packet "<<s.packets<<(dumper?" -> pcap":" -> intf"+std::to_string(p.output+1))<<": "<<p.bytes.size()<<" octets\n";previous.ts=original.ts;hasPrevious=true;
             if(c.statsEnabled&&c.statsInterval>0&&now>=nextStats){double elapsed=std::chrono::duration<double>(now-s.start).count();std::cout<<"Progress: "<<s.packets<<" packets, "<<std::fixed<<std::setprecision(2)<<s.packets/std::max(elapsed,.000001)<<" pps\n";nextStats=now+std::chrono::seconds(c.statsInterval);}}
         if(!hasPackets){std::cerr<<"Erreur: les captures ne contiennent aucun paquet\n";return false;}if(!c.cacheFile.empty()&&packetNumber!=c.cachePackets){std::cerr<<"Erreur: le cache tcpprep contient "<<c.cachePackets<<" decisions pour "<<packetNumber<<" paquets\n";return false;}
         if(c.statsEnabled&&c.statsInterval==0)std::cout<<"Loop "<<(loop+1)<<": "<<s.packets<<" packets sent\n";
@@ -300,12 +304,12 @@ void stats(const Stats& s){double elapsed=std::chrono::duration<double>(std::chr
 }
 int main(int argc,char** argv){
     Config c;std::string error;auto parsed=parse(argc,argv,c,error);if(parsed==Parse::Exit)return 0;if(parsed==Parse::Error){std::cerr<<"Erreur: "<<error<<"\nUtilisez --help pour l'aide.\n";return 1;}
-    std::vector<std::string> nics;if(!interfaces(nics,parsed==Parse::List))return 1;if(parsed==Parse::List)return 0;
-    if(c.ifaceIndex>=0){if((size_t)c.ifaceIndex>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[c.ifaceIndex];}else{uint64_t i;if(uintValue(c.iface,i)){if(i>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[(size_t)i];}}
-    if(!c.iface2.empty()){uint64_t i;if(uintValue(c.iface2,i)){if(i>=nics.size()){std::cerr<<"Erreur: index de seconde interface hors limites\n";return 1;}c.iface2=nics[(size_t)i];}}
+    std::vector<std::string> nics;if(parsed==Parse::List){if(!interfaces(nics,true))return 1;return 0;}if(c.outputFile.empty()){if(!interfaces(nics,false))return 1;if(c.ifaceIndex>=0){if((size_t)c.ifaceIndex>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[c.ifaceIndex];}else{uint64_t i;if(uintValue(c.iface,i)){if(i>=nics.size()){std::cerr<<"Erreur: index hors limites\n";return 1;}c.iface=nics[(size_t)i];}}if(!c.iface2.empty()){uint64_t i;if(uintValue(c.iface2,i)){if(i>=nics.size()){std::cerr<<"Erreur: index de seconde interface hors limites\n";return 1;}c.iface2=nics[(size_t)i];}}}
     if(!c.cacheFile.empty()&&!loadCache(c,error)){std::cerr<<"Erreur: "<<error<<"\n";return 1;}
     if(c.printPid&&!c.quiet)std::cout<<"PID: "<<GetCurrentProcessId()<<"\n";
     std::vector<Packet> packets;if(c.preload){if(c.dualFile){if(!load(c.inputs[0],packets,error,0)||!load(c.inputs[1],packets,error,1)){std::cerr<<"Erreur de lecture: "<<error<<"\n";return 1;}std::stable_sort(packets.begin(),packets.end(),[](const Packet& a,const Packet& b){return a.ts.tv_sec<b.ts.tv_sec||(a.ts.tv_sec==b.ts.tv_sec&&a.ts.tv_usec<b.ts.tv_usec);});}else for(const auto& input:c.inputs)if(!load(input,packets,error)){std::cerr<<"Erreur de lecture de "<<input<<": "<<error<<"\n";return 1;}if(packets.empty()){std::cerr<<"Erreur: capture vide\n";return 1;}if(!c.quiet)std::cout<<"Preloaded "<<packets.size()<<" packets into memory\n";}
-    char err[PCAP_ERRBUF_SIZE]{};auto dev=pcap_open_live(c.iface.c_str(),65535,0,1,err);if(!dev){std::cerr<<"Erreur d'ouverture: "<<err<<"\n";return 1;}pcap_t* dev2=nullptr;if(!c.iface2.empty()){dev2=pcap_open_live(c.iface2.c_str(),65535,0,1,err);if(!dev2){std::cerr<<"Erreur d'ouverture de la seconde interface: "<<err<<"\n";pcap_close(dev);return 1;}}
-    SetConsoleCtrlHandler(control,TRUE);Stats s;s.start=std::chrono::steady_clock::now();bool ok=false;if(c.preload){MemorySource source(packets);ok=replay(source,dev,dev2,c,s);}else if(c.dualFile){DualFileSource source(c.inputs);ok=replay(source,dev,dev2,c,s);}else{FileSource source(c.inputs);ok=replay(source,dev,dev2,c,s);}stats(s);if(dev2)pcap_close(dev2);pcap_close(dev);return ok?0:1;
+    char err[PCAP_ERRBUF_SIZE]{};pcap_t* dev=nullptr;pcap_t* dev2=nullptr;pcap_t* dumpContext=nullptr;pcap_dumper_t* dumper=nullptr;
+    if(!c.outputFile.empty()){dumpContext=pcap_open_offline(c.inputs[0].c_str(),err);if(!dumpContext){std::cerr<<"Erreur de lecture: "<<err<<"\n";return 1;}int dlt=pcap_datalink(dumpContext);for(size_t i=1;i<c.inputs.size();++i){pcap_t* check=pcap_open_offline(c.inputs[i].c_str(),err);if(!check){std::cerr<<"Erreur de lecture: "<<err<<"\n";pcap_close(dumpContext);return 1;}bool compatible=pcap_datalink(check)==dlt;pcap_close(check);if(!compatible){std::cerr<<"Erreur: les captures ont des types de liaison differents\n";pcap_close(dumpContext);return 1;}}dumper=pcap_dump_open(dumpContext,c.outputFile.c_str());if(!dumper){std::cerr<<"Erreur de creation du PCAP: "<<pcap_geterr(dumpContext)<<"\n";pcap_close(dumpContext);return 1;}}
+    else{dev=pcap_open_live(c.iface.c_str(),65535,0,1,err);if(!dev){std::cerr<<"Erreur d'ouverture: "<<err<<"\n";return 1;}if(!c.iface2.empty()){dev2=pcap_open_live(c.iface2.c_str(),65535,0,1,err);if(!dev2){std::cerr<<"Erreur d'ouverture de la seconde interface: "<<err<<"\n";pcap_close(dev);return 1;}}}
+    SetConsoleCtrlHandler(control,TRUE);Stats s;s.start=std::chrono::steady_clock::now();bool ok=false;if(c.preload){MemorySource source(packets);ok=replay(source,dev,dev2,dumper,c,s);}else if(c.dualFile){DualFileSource source(c.inputs);ok=replay(source,dev,dev2,dumper,c,s);}else{FileSource source(c.inputs);ok=replay(source,dev,dev2,dumper,c,s);}if(dumper&&pcap_dump_flush(dumper)!=0){std::cerr<<"Erreur de finalisation du PCAP\n";ok=false;}stats(s);if(dumper)pcap_dump_close(dumper);if(dumpContext)pcap_close(dumpContext);if(dev2)pcap_close(dev2);if(dev)pcap_close(dev);return ok?0:1;
 }
