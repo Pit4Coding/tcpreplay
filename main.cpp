@@ -21,7 +21,7 @@
 
 namespace {
 #pragma comment(lib, "ws2_32.lib")
-constexpr const char* VERSION = "4.6.0-win.1";
+constexpr const char* VERSION = "4.6.0-win.2";
 std::string programName = "tcpreplay";
 std::atomic_bool stopped{false};
 enum class Speed { Timed, Top, Pps, Mbps, Multiplier };

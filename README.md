@@ -2,6 +2,24 @@
 
 Implémentation Windows native de la suite tcpreplay 4.6, construite avec Visual Studio 2019/CMake et utilisant Npcap pour l’injection réseau.
 
+## Bibliothèque C/C++ et Python
+
+Le port Windows fournit une ABI C stable dans
+`include/tcpreplay/tcpreplay_api.h` :
+
+- `libtcpreplay.dll` et `libtcpreplay.lib` (bibliothèque d’importation) ;
+- `libtcpreplay_static.lib` pour l’édition de liens statique ;
+- `examples/libtcpreplay.cpp` pour C/C++ ;
+- `examples/libtcpreplay.py` pour Python avec `ctypes`.
+
+L’appel `tcpreplay_run()` est synchrone. Un autre thread peut appeler
+`tcpreplay_stop()` et consulter `tcpreplay_get_stats()` pendant le rejeu.
+Le mode `tcpreplay_set_output_pcap()` permet de tester l’intégration sans
+envoyer de trafic sur le réseau.
+
+Le guide complet d’installation, de liaison et d’utilisation est disponible
+dans [docs/LIBTCPREPLAY.md](docs/LIBTCPREPLAY.md).
+
 ## Outils
 
 ### tcpreplay
@@ -39,7 +57,16 @@ cmake -S . -B build-vs2019 -G "Visual Studio 16 2019" -A x64
 cmake --build build-vs2019 --config Release --parallel
 ```
 
-Les exécutables sont produits dans `build-vs2019/bin/Release`.
+Les exécutables et `libtcpreplay.dll` sont produits dans
+`build-vs2019/bin/Release`. Les fichiers `.lib` sont placés dans
+`build-vs2019/lib/Release`.
+
+Pour installer les bibliothèques, le header et l’exemple Python dans un
+répertoire redistribuable :
+
+```powershell
+cmake --install build-vs2019 --config Release --prefix dist
+```
 
 Le projet historique `tcpreplay.sln` continue à construire `tcpreplay.exe`. CMake est le build principal pour la suite complète.
 
@@ -49,6 +76,7 @@ Le projet historique `tcpreplay.sln` continue à construire `tcpreplay.exe`. CMa
 - `rewrite_cli.*` : validation commune des options de transformation ;
 - `pcap_source.*` : streaming, préchargement et dual-file ;
 - `tcpprep_cache.*` : lecture des caches `tcpprep` v04 ;
+- `tcpreplay_api.cpp` et `include/tcpreplay/tcpreplay_api.h` : API C publique ;
 - `main.cpp` : moteur et CLI de `tcpreplay`/`tcpreplay-edit` ;
 - `tcprewrite.cpp` : outil de transformation hors ligne.
 
